@@ -1,0 +1,110 @@
+# 11.16 notes
+
+## 一、 核心业务与数据流架构
+
+**Golden Case Recording（黄金用例录制）**的核心目标，是将用户在调试台跑通的真实 Agent 运行过程，自动拆解、清洗并转化为可供 `agent eval`（基于 Temporal 调度）直接使用的标准评测资产，省去人工手写测试用例与 Mock 环境的成本。
+
+### 1. 一次运行拆解的三类资产
+- **Golden QA（基础问答对）**：提取用户输入（Query / 多轮上下文）与最终回复（Expected Output），用于验证基础回答准确性。
+- **Seed Table（Mock 环境数据）**：提取执行过程中所有外部工具调用（Tool Call）的**工具名 + 入参 $\rightarrow$ 真实返回值**。后续回放评测时直接读取 `Seed Table` 作为模拟环境，无需真实调用外部生产接口。
+- **Replay（执行轨迹）**：记录完整的推理与工具调用顺序，用于对比 Prompt 或模型变更后的执行路径一致性。
+
+### 2. 三端系统集成链路
+1. **数据源头（`web + runtime`）**：用户在调试台与 Agent 对话，`runtime` 产生完整对话历史及 Tool Call 入参/出参。
+2. **中转与入库（`backend`）**：接收录制请求，拉取并清洗原始运行轨迹，按 Mentor 设计的表结构落库（`Golden QA` + `Seed Table` + `Replay`）。
+3. **评测消费端（`agent eval`）**：读取落库后的 Golden Case，通过 Temporal 工作流异步执行回放评测。
+
+---
+
+## 二、 总体开发排期（12 个工作日）
+
+| 阶段 | 时间 | 核心目标 | 关键产出物 |
+| :--- | :--- | :--- | :--- |
+| **一、摸底与对齐** | Day 1 ~ Day 2 | 摸清 Mentor 设计的数据库表结构与 `runtime` 原始数据存储位置；和 Mentor 敲定交互边界与 API 契约。 | `PROJECT_MAP.md`、接口设计草图 |
+| **二、后端核心开发** | Day 3 ~ Day 6 | 编写原始轨迹解析器（Extractor），开发预览与录制保存 API，完成落库并用真实数据在 `agent eval` 跑通一次 Temporal 回放。 | `Extractor` 模块、`preview` & `record` 接口、Eval 回放成功截图 |
+| **三、前端与联调** | Day 7 ~ Day 10 | 在 `web` 调试台增加录制入口与确认/编辑抽屉（支持微调期望回复与查看 Seed Mock 数据），打通前后端全链路。 | 前端录制 UI 组件、端到端联调通过 |
+| **四、兜底与提测** | Day 11 ~ Day 12 | 兼容边界异常（纯文本无工具调用、多轮对话截断、执行报错会话等），补充单测，分开提交前后端 PR。 | 单元测试报告、PR & 演示录屏 |
+
+---
+
+## 三、 Day 1 摸底与 Mentor 对齐清单
+
+优先查清以下 4 个核心问题（通过查代码 + 与 Mentor 沟通 15 分钟确认）：
+
+
+
+1. **数据库表结构**：找到 Mentor 近期提交的建表语句或 ORM Model，明确 `Golden QA`、`Seed Table`、`Replay` 各自的表名、字段类型及外键关联关系。
+2. **Runtime 原始数据源**：确认调试台对话结束后，包含 `tool_calls` 和 `tool_output` 的完整消息列表是否已持久化到数据库/Redis（有则后端直接按 `session_id` 查询；无则需在 Runtime 加钩子或由前端传递）。
+3. **与 `agent eval` 的衔接**：确认数据写入 Mentor 设计的表后，`agent eval` 是直接查库读取，还是需要调用 `agent eval` 的接口 / 触发 Temporal Workflow 通知。
+4. **交互触发形式**：确认前端采用**“事后录制”**（在已有对话记录上点击“保存为 Golden Case”，推荐）还是“开关录制”模式，以及保存前是否允许用户手动编辑 `Expected Output` 和 `Seed` 数据。
+
+---
+
+## 四、  Claude Code 交互 Prompt 库
+
+> **使用原则**：底层对接开源模型时，务必遵循**“先扫描沉淀上下文 $\rightarrow$ 先出方案再改码 $\rightarrow$ 指定现有文件照葫芦画瓢 $\rightarrow$ 终端自测闭环”**。将 `web+runtime` 和 `backend` 放在同一父目录下启动 Claude Code。
+
+### 1. 代码库侦察阶段（Day 1 上午使用）
+
+**Prompt 1：生成项目全局地图（沉淀上下文）**
+```text
+请扫描当前目录下的 `backend` 和 `web+runtime` 两个仓库。用精简的要点总结：
+1) 各自的技术栈和核心目录结构；
+2) `runtime` 是如何执行一个 Agent 并处理工具调用（Tool Call）的；
+3) `backend` 的 API 路由、数据库 ORM 和鉴权是怎么组织的。
+请把结果总结并写入当前目录的 `PROJECT_MAP.md` 中，只写事实，标注对应的核心文件路径。
+```
+
+**Prompt 2：定位 Mentor 刚设计的数据库表**
+```text
+请在 `backend` 仓库中执行 `git log -n 15 --stat`，并搜索近期新增或修改的数据库 Model、Migration（迁移脚本）或 Schema 文件，找出和 `golden`、`case`、`seed`、`replay`、`eval` 相关的表结构定义。列出完整的表名、字段名、字段类型及外键关系，给出具体文件路径和行号。
+```
+
+**Prompt 3：锁定 Runtime 的对话与工具调用数据源**
+```text
+在 `web+runtime` 仓库中追踪一次 Agent 对话的完整生命周期：当 Agent 完成多轮推理并调用工具（Tool Call）后，完整的消息历史、工具入参和工具返回值（Tool Output）目前是否持久化到了数据库或 Redis？请给出存储逻辑的代码文件路径；如果没有持久化，请指出前端或 Runtime 内存中保存这些完整轨迹的变量位置。
+```
+
+**Prompt 4：检查与外部 `agent eval` 的现有集成**
+```text
+在所有仓库中全局搜索 `eval`、`temporal`、`replay`、`seed` 关键词，检查现有代码里是否已经存在调用外部评测系统（或写入评测库、触发 Temporal Workflow）的 Client 封装或配置项。
+```
+
+---
+
+### 2. 编码与测试阶段（开发期按需使用）
+
+**Prompt 5：强制先出方案，防止乱改代码**
+```text
+基于 `PROJECT_MAP.md` 和 Mentor 的表结构，我要在 `backend` 实现一个将 `session_id` 对应的对话记录转换为 Golden Case（含 QA、Seed Mock 环境和 Replay 轨迹）的 Service。
+先不要修改任何代码，请先列出你的实现方案、需要新建或修改的文件清单，以及核心数据映射逻辑的伪代码，等我确认后再动手。
+```
+
+**Prompt 6：后端接口开发（照葫芦画瓢）**
+```text
+请参考 `backend/app/api/v1/<现有类似路由文件>.py` 的路由风格、依赖注入（鉴权/DB Session）和统一返回格式，以及 `backend/app/services/<现有类似服务>.py` 的写法：
+1) 实现 `GoldenCaseExtractor` 类，将原始对话拆解为 `Golden QA` 和 `Seed Table` 数据；
+2) 新增 `POST /preview`（预览提取结果）和 `POST /record`（确认入库）两个接口。
+```
+
+**Prompt 7：前端组件开发（照葫芦画瓢）**
+```text
+请参考 `web/src/components/<现有类似抽屉或弹窗组件>.tsx` 的 UI 组件库用法、状态管理和接口请求封装方式，在调试台对话页面增加“录制为 Golden Case”按钮及对应的确认抽屉组件：
+1) 点击按钮调用 `/preview` 接口加载自动提取的输入、期望回复和 Seed Mock 工具列表；
+2) 支持用户修改期望回复和用例名称；
+3) 点击保存调用 `/record` 接口并给出成功提示。
+```
+
+**Prompt 8：编写单元测试并终端自测闭环**
+```text
+请为你刚写的 `GoldenCaseExtractor` 编写单元测试（覆盖：包含多次工具调用的对话、无工具调用的纯文本对话、多轮上下文对话三种场景），然后直接在终端运行 `pytest` 执行测试，如果报错请直接分析原因并修复，直到测试全部通过。
+```
+
+---
+
+## 五、 每日工作流节奏
+
+
+
+- **白天**：使用上述 Prompt 驱动本地 Claude Code 探索仓库、编写代码并运行 `pytest` 自测；遇到业务规则模糊点直接与 Mentor 对齐。
+- **晚上**：整理白天遇到的架构疑问、脱敏后的表结构字段关系或卡点报错，梳理好次日的开发方案与 Prompt 调整方向。
